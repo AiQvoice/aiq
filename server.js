@@ -1,103 +1,164 @@
 import express from "express";
-import { WebSocketServer } from "ws";
-import fetch from "node-fetch";
+import bodyParser from "body-parser";
+import twilio from "twilio";
+import http from "http";
+import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
-app.use(express.json());
+app.use(bodyParser.urlencoded({ extended: false }));
+const server = http.createServer(app);
 
-// Twilio kommer hit först och kräver WebSocket URL i svaret
+const OPENAI_REALTIME_URL =
+  "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+
+//
+// 1) INKOMMANDE SAMTAL
+//
 app.post("/voice", (req, res) => {
-  const response = `
-    <Response>
-      <Connect>
-        <Stream url="wss://${req.headers.host}/media" />
-      </Connect>
-    </Response>
-  `;
+  const vr = new twilio.twiml.VoiceResponse();
 
-  res.type("text/xml");
-  res.send(response);
+  vr.say(
+    { voice: "alice", language: "sv-SE" },
+    "Hej! Mitt namn är Aique. Hur kan jag hjälpa dig?"
+  );
+
+  const connect = vr.connect();
+  connect.stream({
+    url: "wss://aiqvoice.onrender.com/stream",
+    name: "aiqvoice-realtime"
+  });
+
+  // ✅ Viktigt: håll samtalet öppet
+  vr.pause({ length: 600 });
+
+  res.type("text/xml").send(vr.toString());
 });
 
-// WebSocket-server för Twilio Media Stream
+app.get("/", (req, res) => res.send("AIQVoice realtime är igång"));
+
+//
+// 2) WEBSOCKET-SERVER (Twilio <-> OpenAI)
+//
 const wss = new WebSocketServer({ noServer: true });
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+server.on("upgrade", (req, socket, head) => {
+  if (req.url && req.url.startsWith("/stream")) {
+    wss.handleUpgrade(req, socket, head, (ws) =>
+      wss.emit("connection", ws, req)
+    );
+  } else {
+    socket.destroy();
+  }
+});
 
-// När Twilio ansluter med WebSocket
-wss.on("connection", async (ws, req) => {
-  console.log("🔗 Twilio WebSocket ansluten!");
+wss.on("connection", (twilioWs) => {
+  let streamSid = null;
 
-  // Öppna anslutning till OpenAI Realtime API
-  const openaiWs = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17", {
+  let openaiReady = false;
+  const pendingAudio = []; // ✅ buffer tills OpenAI är redo
+
+  const openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       "OpenAI-Beta": "realtime=v1"
     }
   });
 
   openaiWs.on("open", () => {
-    console.log("🤖 OpenAI WebSocket ansluten!");
+    console.log("✅ OpenAI WS open");
+    openaiReady = true;
 
-    // Skicka initial prompt
     openaiWs.send(JSON.stringify({
       type: "session.update",
       session: {
-        instructions: "Du heter Aique. Du är en vänlig svensk assistent. Svara direkt och naturligt.",
-        modalities: ["audio"],
-        voice: "alloy",
-        input_audio_format: "pcm16",
-        output_audio_format: "pcm16",
-        turn_detection: { type: "server_vad" }
+        output_modalities: ["audio"],
+        audio: {
+          input: {
+            format: { type: "audio/pcmu" },
+            turn_detection: { type: "server_vad" }
+          },
+          output: {
+            format: { type: "audio/pcmu" },
+            voice: "alloy"
+          }
+        },
+        instructions:
+          "Du heter Aique och är en svensk AI-telefonassistent. Svara supersnabbt, kort och naturligt på svenska. Hjälp direkt. Om oklart, ställ EN kort följdfråga."
       }
     }));
+
+    // ✅ skicka allt audio som kom innan OpenAI var redo
+    while (pendingAudio.length) {
+      openaiWs.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: pendingAudio.shift()
+      }));
+    }
   });
 
-  // När OpenAI skickar tillbaka svar → skicka till Twilio
-  openaiWs.on("message", (data) => {
-    const msg = JSON.parse(data.toString());
+  // OpenAI -> Twilio (AI-ljud ut)
+  openaiWs.on("message", (raw) => {
+    const msg = JSON.parse(raw.toString());
 
-    if (msg.type === "response.output_audio.delta") {
-      ws.send(JSON.stringify({
+    // När din tal-turn är klar, trigga svar
+    if (
+      msg.type === "input_audio_buffer.speech_stopped" ||
+      msg.type === "input_audio_buffer.committed"
+    ) {
+      openaiWs.send(JSON.stringify({ type: "response.create" }));
+      return;
+    }
+
+    if (msg.type === "response.output_audio.delta" && msg.delta) {
+      twilioWs.send(JSON.stringify({
         event: "media",
+        streamSid,
         media: { payload: msg.delta }
       }));
     }
   });
 
-  // När Twilio skickar audio → skicka till OpenAI
-  ws.on("message", (data) => {
-    const msg = JSON.parse(data.toString());
+  openaiWs.on("error", (e) =>
+    console.error("OpenAI WS error:", e)
+  );
+  openaiWs.on("close", () => {
+    console.log("OpenAI WS closed");
+    openaiReady = false;
+  });
 
-    if (msg.event === "media") {
-      openaiWs.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: msg.media.payload
-      }));
+  // Twilio -> OpenAI (din röst in)
+  twilioWs.on("message", (raw) => {
+    const data = JSON.parse(raw.toString());
+
+    if (data.event === "start") {
+      streamSid = data.start.streamSid;
+      console.log("✅ Twilio stream start:", streamSid);
+      return;
     }
 
-    if (msg.event === "stop") {
-      openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    if (data.event === "media" && data.media?.payload) {
+      if (!openaiReady) {
+        pendingAudio.push(data.media.payload); // ✅ buffra
+      } else {
+        openaiWs.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: data.media.payload
+        }));
+      }
+      return;
+    }
+
+    if (data.event === "stop") {
+      try { openaiWs.close(); } catch {}
     }
   });
 
-  ws.on("close", () => {
-    console.log("❌ Twilio WebSocket stängd");
-    openaiWs.close();
+  twilioWs.on("close", () => {
+    try { openaiWs.close(); } catch {}
   });
 });
 
-// Hantera WebSocket upgrade
-const server = app.listen(process.env.PORT || 3000, () => {
-  console.log("🚀 Server körs");
-});
-
-server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/media") {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
-  } else {
-    socket.destroy();
-  }
-});
+const port = process.env.PORT || 3000;
+server.listen(port, () =>
+  console.log("🚀 Server kör på port", port)
+);
