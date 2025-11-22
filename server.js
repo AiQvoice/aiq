@@ -8,25 +8,36 @@ app.use(bodyParser.urlencoded({ extended: false }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// Viktigt: absolut base-url för action-länkar
+const BASE_URL = "https://aiqvoice.onrender.com";
+
 // --- HANTERA INKOMMANDE SAMTAL ---
 async function handleVoice(req, res) {
   const twiml = new twilio.twiml.VoiceResponse();
 
-  // Svenskt välkomstmeddelande
   twiml.say(
     { voice: "alice", language: "sv-SE" },
-    "Välkommen till AIQ Voice. Berätta kort vad ditt ärende gäller, så hjälper jag dig."
+    "Välkommen till AIQ Voice. Efter pipet kan du berätta kort vad ditt ärende gäller."
   );
 
-  // Lyssna på tal
-  twiml.gather({
+  // liten paus för att inte klippa första ordet
+  twiml.pause({ length: 1 });
+
+  const gather = twiml.gather({
     input: "speech",
-    action: "/gather",
+    action: `${BASE_URL}/gather`,   // ABSOLUT URL
     method: "POST",
-    timeout: 5,
+    timeout: 8,                    // längre tid att börja prata
     speechTimeout: "auto",
-    language: "sv-SE", // <-- viktig för svenskt tal
+    language: "sv-SE",
+    actionOnEmptyResult: true,     // kör /gather även om Twilio hör tomt
   });
+
+  // om Gather av nån anledning inte triggar, fallback:
+  twiml.say(
+    { voice: "alice", language: "sv-SE" },
+    "Jag hörde inget. Kan du försöka igen?"
+  );
 
   res.type("text/xml");
   res.send(twiml.toString());
@@ -38,7 +49,33 @@ app.post("/voice", handleVoice);
 // --- HANTERA SVAR FRÅN ANVÄNDAREN ---
 app.post("/gather", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
-  const userText = req.body.SpeechResult || "";
+
+  // Twilio kan ibland ge tom SpeechResult
+  const userText =
+    (req.body.SpeechResult ||
+      req.body.UnstableSpeechResult ||
+      "").trim();
+
+  // Om Twilio inte hörde något -> be om nytt försök
+  if (!userText) {
+    twiml.say(
+      { voice: "alice", language: "sv-SE" },
+      "Jag hörde dig inte riktigt. Kan du säga det en gång till, lite tydligare?"
+    );
+
+    twiml.gather({
+      input: "speech",
+      action: `${BASE_URL}/gather`,
+      method: "POST",
+      timeout: 8,
+      speechTimeout: "auto",
+      language: "sv-SE",
+      actionOnEmptyResult: true,
+    });
+
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  }
 
   try {
     const completion = await openai.chat.completions.create({
@@ -47,35 +84,35 @@ app.post("/gather", async (req, res) => {
         {
           role: "system",
           content:
-            "Du är en svensk AI-telefonassistent för ett företag med mycket telefonköer. Svara kort, vänligt och professionellt. Ställ följdfrågor vid behov.",
+            "Du är en svensk AI-telefonassistent för ett företag med långa telefonköer. Svara kort, vänligt och professionellt. Ställ en enkel följdfråga om det behövs.",
         },
         { role: "user", content: userText },
       ],
-      max_tokens: 120,
+      max_tokens: 140,
       temperature: 0.4,
     });
 
     const aiText =
       completion.choices?.[0]?.message?.content?.trim() ||
-      "Jag uppfattade inte det. Kan du säga det igen?";
+      "Jag är inte helt säker på att jag förstår. Kan du förtydliga?";
 
-    // Svara med svensk röst
     twiml.say({ voice: "alice", language: "sv-SE" }, aiText);
 
-    // Lyssna igen — samtalsloop
+    // Lyssna vidare i samtalet
     twiml.gather({
       input: "speech",
-      action: "/gather",
+      action: `${BASE_URL}/gather`,
       method: "POST",
-      timeout: 5,
+      timeout: 8,
       speechTimeout: "auto",
       language: "sv-SE",
+      actionOnEmptyResult: true,
     });
   } catch (err) {
     console.error(err);
     twiml.say(
       { voice: "alice", language: "sv-SE" },
-      "Ett fel inträffade. Försök igen om en liten stund."
+      "Ett fel inträffade i systemet. Försök igen om en liten stund."
     );
   }
 
