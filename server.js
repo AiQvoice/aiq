@@ -8,21 +8,24 @@ app.use(bodyParser.urlencoded({ extended: false }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- VOICE HANDLER ---
+// --- HANTERA INKOMMANDE SAMTAL ---
 async function handleVoice(req, res) {
   const twiml = new twilio.twiml.VoiceResponse();
 
-  twiml.say({ voice: "alice", language: "sv-SE" }, "Välkommen till AIQ Voice. Berätta vad ditt ärende gäller så hjälper jag dig.")
-
+  // Svenskt välkomstmeddelande
+  twiml.say(
+    { voice: "alice", language: "sv-SE" },
+    "Välkommen till AIQ Voice. Berätta kort vad ditt ärende gäller, så hjälper jag dig."
   );
 
+  // Lyssna på tal
   twiml.gather({
     input: "speech",
     action: "/gather",
     method: "POST",
     timeout: 5,
     speechTimeout: "auto",
-language: "sv-SE"
+    language: "sv-SE", // <-- viktig för svenskt tal
   });
 
   res.type("text/xml");
@@ -32,7 +35,7 @@ language: "sv-SE"
 app.get("/voice", handleVoice);
 app.post("/voice", handleVoice);
 
-// --- GATHER ---
+// --- HANTERA SVAR FRÅN ANVÄNDAREN ---
 app.post("/gather", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const userText = req.body.SpeechResult || "";
@@ -44,33 +47,35 @@ app.post("/gather", async (req, res) => {
         {
           role: "system",
           content:
-            "You are an AI phone assistant for a company with long queues. Keep answers short and helpful.",
+            "Du är en svensk AI-telefonassistent för ett företag med mycket telefonköer. Svara kort, vänligt och professionellt. Ställ följdfrågor vid behov.",
         },
         { role: "user", content: userText },
       ],
-      max_tokens: 100,
+      max_tokens: 120,
       temperature: 0.4,
     });
 
     const aiText =
       completion.choices?.[0]?.message?.content?.trim() ||
-      "I didn't catch that. Could you repeat?";
+      "Jag uppfattade inte det. Kan du säga det igen?";
 
-    twiml.say({ voice: "alice", language: "en-US" }, aiText);
+    // Svara med svensk röst
+    twiml.say({ voice: "alice", language: "sv-SE" }, aiText);
 
+    // Lyssna igen — samtalsloop
     twiml.gather({
       input: "speech",
       action: "/gather",
       method: "POST",
       timeout: 5,
       speechTimeout: "auto",
-      language: "en-US",
+      language: "sv-SE",
     });
   } catch (err) {
     console.error(err);
     twiml.say(
-      { voice: "alice", language: "en-US" },
-      "Something went wrong. Please try again later."
+      { voice: "alice", language: "sv-SE" },
+      "Ett fel inträffade. Försök igen om en liten stund."
     );
   }
 
@@ -78,7 +83,8 @@ app.post("/gather", async (req, res) => {
   res.send(twiml.toString());
 });
 
-app.get("/", (req, res) => res.send("AIQVoice is running"));
+// Health check
+app.get("/", (req, res) => res.send("AIQVoice är igång"));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Server running on", port));
+app.listen(port, () => console.log("Server kör på port", port));
