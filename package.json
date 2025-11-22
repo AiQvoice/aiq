@@ -1,13 +1,14 @@
 {
-  "instructions": "Du heter Aique. Du är en snabb och naturlig svensk röstassistent.",
-  "modalities": ["audio"],
-  "voice": "alloy",
-  "turn_detection": {
-    "type": "server_vad",
-    "threshold": 0.5,
-    "prefix_padding_ms": 300
+  "name": "aiqvoice",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
   },
-  "input_audio_format": "pcm16",
-  "output_audio_format": "pcm16",
-  "temperature": 0.7
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
 }
