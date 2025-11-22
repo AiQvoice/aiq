@@ -1,48 +1,65 @@
-import 'dotenv/config';
+import "dotenv/config";
 import express from "express";
 import http from "http";
-import { WebSocketServer, WebSocket } from "ws";
-import twilio from "twilio";
+import WebSocket, { WebSocketServer } from "ws";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// ====== 1) Twilio webhook för inkommande samtal ======
+// 1) Twilio webhook
 app.post("/voice", (req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
 
-  twiml.say(
-    { voice: "alice", language: "sv-SE" },
-    "Hej! Mitt namn är AiQ. Hur kan jag hjälpa dig?"
-  );
+  // ✅ Din nya logik:
+  // - Presenterar sig
+  // - Väntar 5 sek
+  // - Säger "Ja hallå?"
+  // - Startar realtime-stream
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice" language="sv-SE">
+    Hej! Mitt namn är AiQ. Hur kan jag hjälpa dig?
+  </Say>
 
-  // Starta Media Stream till vår WS
-  twiml.connect().stream({
-    url: `wss://${req.headers.host}/media`
-  });
+  <Pause length="5"/>
 
-  res.type("text/xml");
-  res.send(twiml.toString());
+  <Say voice="alice" language="sv-SE">
+    Ja hallå?
+  </Say>
+
+  <Connect>
+    <Stream url="wss://${host}/media-stream" />
+  </Connect>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
 });
 
-// healthcheck
 app.get("/", (req, res) => res.send("aiqvoice is running"));
 
-// ====== 2) Server + WS ======
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/media" });
+
+// 2) WebSocket route för Twilio Media Streams
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url && req.url.startsWith("/media-stream")) {
+    wss.handleUpgrade(req, socket, head, ws => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
 wss.on("connection", (twilioWs) => {
-  console.log("Twilio WS connected");
-
+  console.log("✅ Twilio WS connected");
   let streamSid = null;
 
-  // Öppna WS mot OpenAI Realtime
-  const openaiWs = new WebSocket(
+  const openAiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-realtime",
     {
       headers: {
@@ -52,136 +69,108 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
-  openaiWs.on("open", () => {
-    console.log("OpenAI WS open");
-
-    // Startsession
+  const sendSessionUpdate = () => {
     const sessionUpdate = {
       type: "session.update",
       session: {
-        // Viktigt: matcha Twilio (g711_ulaw)
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-
-        // Server-VAD triggar speech_started/stopped automatiskt
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 600
+        output_modalities: ["audio"],
+        audio: {
+          input: {
+            format: { type: "audio/pcmu" },
+            turn_detection: { type: "server_vad" }
+          },
+          output: {
+            format: { type: "audio/pcmu" },
+            voice: "alloy"
+          }
         },
-
-        // Svensk transkribering för bättre förståelse
-        input_audio_transcription: {
-          model: "gpt-4o-mini-transcribe",
-          language: "sv"
-        },
-
-        // Röst + instruktioner
-        voice: "marin",
         instructions:
-          "Du är AiQ (uttalas Aique). " +
-          "Svara snabbt och naturligt på svenska. " +
-          "Ställ följdfrågor om något är oklart. " +
-          "Avsluta inte samtalet själv."
+          "Du är AiQ, en svensk AI-telefonassistent.\n" +
+          "Låt varm, levande, snabb och professionell.\n" +
+          "Svara kort och naturligt på svenska.\n" +
+          "Om något är oklart, ställ EN kort följdfråga."
       }
     };
 
-    openaiWs.send(JSON.stringify(sessionUpdate));
+    console.log("Sending session.update");
+    openAiWs.send(JSON.stringify(sessionUpdate));
+  };
+
+  openAiWs.on("open", () => {
+    console.log("✅ OpenAI WS open");
+    setTimeout(sendSessionUpdate, 250);
   });
 
-  // Ta emot ljud från Twilio -> skicka till OpenAI
-  twilioWs.on("message", (msg) => {
-    const data = JSON.parse(msg);
-
-    if (data.event === "start") {
-      streamSid = data.start.streamSid;
-      console.log("Stream started:", streamSid);
+  // OpenAI -> Twilio (AI-audio tillbaka)
+  openAiWs.on("message", (data) => {
+    let resp;
+    try {
+      resp = JSON.parse(data.toString());
+    } catch {
       return;
     }
 
-    if (data.event === "media") {
-      // data.media.payload är base64 g711_ulaw
-      const audioAppend = {
-        type: "input_audio_buffer.append",
-        audio: data.media.payload
-      };
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.send(JSON.stringify(audioAppend));
+    if (resp.type === "error") {
+      console.log("❌ OPENAI ERROR:", resp);
+      return;
+    }
+
+    // ✅ Rätt event för audio tillbaka
+    if (resp.type === "response.output_audio.delta" && resp.delta) {
+      twilioWs.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: resp.delta }
+      }));
+    }
+
+    // Om du börjar prata medan AI pratar → stoppa AI-ljudet
+    if (resp.type === "input_audio_buffer.speech_started") {
+      if (streamSid) {
+        twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+      }
+    }
+  });
+
+  // Twilio -> OpenAI (din röst in)
+  twilioWs.on("message", (message) => {
+    let data;
+    try {
+      data = JSON.parse(message.toString());
+    } catch {
+      return;
+    }
+
+    if (data.event === "start") {
+      streamSid = data.start.streamSid;
+      console.log("Incoming stream started:", streamSid);
+      return;
+    }
+
+    if (data.event === "media" && data.media?.payload) {
+      if (openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: data.media.payload
+        }));
       }
       return;
     }
 
     if (data.event === "stop") {
       console.log("Stream stopped");
-      openaiWs.close();
-      twilioWs.close();
-      return;
+      if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
     }
-  });
-
-  // OpenAI events -> tillbaka till Twilio
-  openaiWs.on("message", (raw) => {
-    let event;
-    try {
-      event = JSON.parse(raw);
-    } catch (e) {
-      console.log("Bad JSON from OpenAI", raw.toString());
-      return;
-    }
-
-    // DEBUG: logga riktiga error-event
-    if (event.type === "error") {
-      console.error("OpenAI ERROR:", event);
-      return;
-    }
-
-    // När användaren slutat prata -> be modellen svara
-    if (event.type === "input_audio_buffer.speech_stopped") {
-      console.log("speech_stopped -> response.create");
-
-      const create = {
-        type: "response.create",
-        response: {
-          modalities: ["audio"],
-          instructions:
-            "Svara kort och tydligt på svenska, som en människa i realtid."
-        }
-      };
-      openaiWs.send(JSON.stringify(create));
-      return;
-    }
-
-    // Strömma tillbaka AI-ljud
-    if (event.type === "response.audio.delta" && event.delta) {
-      const twilioMsg = {
-        event: "media",
-        streamSid,
-        media: { payload: event.delta }
-      };
-      if (twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.send(JSON.stringify(twilioMsg));
-      }
-      return;
-    }
-  });
-
-  openaiWs.on("close", () => {
-    console.log("OpenAI WS closed");
-  });
-
-  openaiWs.on("error", (err) => {
-    console.error("OpenAI WS socket error:", err);
   });
 
   twilioWs.on("close", () => {
     console.log("Twilio WS closed");
-    openaiWs.close();
+    if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
   });
 
-  twilioWs.on("error", (err) => {
-    console.error("Twilio WS error:", err);
-  });
+  openAiWs.on("close", () => console.log("OpenAI WS closed"));
+  openAiWs.on("error", (e) => console.error("OpenAI WS error:", e));
 });
 
 server.listen(PORT, () => {
