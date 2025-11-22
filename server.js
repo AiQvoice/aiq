@@ -6,49 +6,42 @@ import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
-
 const server = http.createServer(app);
 
-// OpenAI Realtime WS endpoint
 const OPENAI_REALTIME_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
 //
-// 1) INKOMMANDE SAMTAL -> starta realtime-stream
+// 1) INKOMMANDE SAMTAL -> starta stream
 //
 app.post("/voice", (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
 
-  // ⭐ DIN RENA HÄLSNING ⭐
   vr.say(
     { voice: "alice", language: "sv-SE" },
     "Hej! Mitt namn är Aique. Hur kan jag hjälpa dig?"
   );
 
-  // <Connect><Stream> = bidirectional Media Streams
   const connect = vr.connect();
   connect.stream({
     url: "wss://aiqvoice.onrender.com/stream",
     name: "aiqvoice-realtime"
   });
 
-  // håll samtalet öppet
   vr.pause({ length: 600 });
-
   res.type("text/xml").send(vr.toString());
 });
 
-// Health check
 app.get("/", (req, res) => res.send("AIQVoice realtime är igång"));
 
 //
-// 2) WebSocket-server: Twilio Media Stream <-> OpenAI Realtime
+// 2) WebSocket-server (Twilio <-> OpenAI)
 //
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/stream") {
-    wss.handleUpgrade(req, socket, head, ws => {
+    wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws);
     });
   } else {
@@ -59,8 +52,8 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (twilioWs) => {
   let streamSid = null;
   let openaiReady = false;
+  let awaitingResponse = false;
 
-  // Koppla upp mot OpenAI Realtime
   const openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -69,15 +62,13 @@ wss.on("connection", (twilioWs) => {
   });
 
   openaiWs.on("open", () => {
-    // Twilio Media Streams använder G.711 μ-law (PCMU).
-    // Vi matchar input/output för lägsta latency. :contentReference[oaicite:1]{index=1}
     const sessionUpdate = {
       type: "session.update",
       session: {
         output_modalities: ["audio"],
         audio: {
           input: {
-            format: { type: "audio/pcmu" },
+            format: { type: "audio/pcmu" }, // Twilio G.711 μ-law
             turn_detection: { type: "server_vad" }
           },
           output: {
@@ -86,7 +77,7 @@ wss.on("connection", (twilioWs) => {
           }
         },
         instructions:
-          "Du är Aique, en svensk AI-telefonassistent för företag med telefonköer. Var extremt responsiv, kort, trygg och professionell. Hjälp direkt. Om något är oklart, fråga EN kort följdfråga. Prata svenska."
+          "Du är Aique, en svensk AI-telefonassistent. Var superresponsiv, kort, trygg och professionell. Hjälp direkt. Om oklart, ställ max en kort följdfråga. Prata svenska."
       }
     };
 
@@ -97,25 +88,45 @@ wss.on("connection", (twilioWs) => {
   });
 
   //
-  // 3) OPENAI -> TWILIO (AI-ljud tillbaka)
+  // 3) OPENAI -> TWILIO
   //
   openaiWs.on("message", (raw) => {
     const msg = JSON.parse(raw.toString());
 
-    // OpenAI skickar ljud i response.output_audio.delta via WS. :contentReference[oaicite:2]{index=2}
+    // ✅ När OpenAI tycker att en tal-turn är klar (VAD commit)
+    // trigga ett svar!
+    if (
+      (msg.type === "input_audio_buffer.committed" ||
+        msg.type === "input_audio_buffer.speech_stopped") &&
+      !awaitingResponse
+    ) {
+      awaitingResponse = true;
+      openaiWs.send(JSON.stringify({ type: "response.create" }));
+      return;
+    }
+
+    // ✅ AI-ljud tillbaka
     if (msg.type === "response.output_audio.delta" && msg.delta) {
-      twilioWs.send(JSON.stringify({
-        event: "media",
-        streamSid,
-        media: {
-          payload: Buffer.from(msg.delta, "base64").toString("base64")
-        }
-      }));
+      twilioWs.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: {
+            payload: Buffer.from(msg.delta, "base64").toString("base64")
+          }
+        })
+      );
+      return;
+    }
+
+    // ✅ När svaret är klart -> tillåt nästa turn
+    if (msg.type === "response.done") {
+      awaitingResponse = false;
     }
   });
 
   //
-  // 4) TWILIO -> OPENAI (caller-ljud in)
+  // 4) TWILIO -> OPENAI (caller-audio in)
   //
   twilioWs.on("message", (raw) => {
     const data = JSON.parse(raw.toString());
@@ -126,10 +137,12 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (data.event === "media" && data.media?.payload && openaiReady) {
-      openaiWs.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: data.media.payload
-      }));
+      openaiWs.send(
+        JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: data.media.payload
+        })
+      );
     }
 
     if (data.event === "stop") {
@@ -146,8 +159,5 @@ wss.on("connection", (twilioWs) => {
   twilioWs.on("error", (e) => console.error("Twilio WS error:", e));
 });
 
-//
-// Starta server
-//
 const port = process.env.PORT || 3000;
 server.listen(port, () => console.log("Realtime server kör på port", port));
