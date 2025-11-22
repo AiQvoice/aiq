@@ -12,9 +12,8 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 async function handleVoice(req, res) {
   const twiml = new twilio.twiml.VoiceResponse();
 
-  twiml.say(
-    { voice: "alice", language: "en-US" },
-    "Welcome to A I Q Voice. Please tell me what your call is about."
+  twiml.say({ voice: "alice", language: "sv-SE" }, "Välkommen till AIQ Voice. Berätta vad ditt ärende gäller så hjälper jag dig.")
+
   );
 
   twiml.gather({
@@ -23,7 +22,7 @@ async function handleVoice(req, res) {
     method: "POST",
     timeout: 5,
     speechTimeout: "auto",
-    language: "en-US",
+language: "sv-SE"
   });
 
   res.type("text/xml");
