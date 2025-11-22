@@ -1,127 +1,167 @@
 import express from "express";
 import bodyParser from "body-parser";
-import OpenAI from "openai";
 import twilio from "twilio";
+import http from "http";
+import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const server = http.createServer(app);
 
-// Viktigt: absolut base-url för action-länkar
+// ÄNDRA INTE om du kör samma domän:
 const BASE_URL = "https://aiqvoice.onrender.com";
 
-// --- HANTERA INKOMMANDE SAMTAL ---
-async function handleVoice(req, res) {
-  const twiml = new twilio.twiml.VoiceResponse();
+// OpenAI Realtime WS-endpoint (officiell)
+const OPENAI_REALTIME_URL =
+  "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-  twiml.say(
+// ---- 1) Twilio webhook när samtal kommer in ----
+app.post("/voice", (req, res) => {
+  const vr = new twilio.twiml.VoiceResponse();
+
+  // Din exakta hälsning, ingen pip
+  vr.say(
     { voice: "alice", language: "sv-SE" },
-    "Välkommen till AIQ Voice. Efter pipet kan du berätta kort vad ditt ärende gäller."
+    "Hej! Mitt namn är AiQ, det uttalas Aique."
   );
 
-  // liten paus för att inte klippa första ordet
-  twiml.pause({ length: 1 });
-
-  const gather = twiml.gather({
-    input: "speech",
-    action: `${BASE_URL}/gather`,   // ABSOLUT URL
-    method: "POST",
-    timeout: 8,                    // längre tid att börja prata
-    speechTimeout: "auto",
-    language: "sv-SE",
-    actionOnEmptyResult: true,     // kör /gather även om Twilio hör tomt
+  // Starta BIDIRECTIONAL stream så vi kan spela upp AI-ljud i samtalet
+  const connect = vr.connect();
+  connect.stream({
+    url: `wss://aiqvoice.onrender.com/stream`,
+    name: "aiqvoice-realtime"
   });
 
-  // om Gather av nån anledning inte triggar, fallback:
-  twiml.say(
-    { voice: "alice", language: "sv-SE" },
-    "Jag hörde inget. Kan du försöka igen?"
-  );
+  // Håll samtalet öppet (Twilio måste ha något efter Stream)
+  vr.pause({ length: 600 });
 
-  res.type("text/xml");
-  res.send(twiml.toString());
-}
-
-app.get("/voice", handleVoice);
-app.post("/voice", handleVoice);
-
-// --- HANTERA SVAR FRÅN ANVÄNDAREN ---
-app.post("/gather", async (req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-
-  // Twilio kan ibland ge tom SpeechResult
-  const userText =
-    (req.body.SpeechResult ||
-      req.body.UnstableSpeechResult ||
-      "").trim();
-
-  // Om Twilio inte hörde något -> be om nytt försök
-  if (!userText) {
-    twiml.say(
-      { voice: "alice", language: "sv-SE" },
-      "Jag hörde dig inte riktigt. Kan du säga det en gång till, lite tydligare?"
-    );
-
-    twiml.gather({
-      input: "speech",
-      action: `${BASE_URL}/gather`,
-      method: "POST",
-      timeout: 8,
-      speechTimeout: "auto",
-      language: "sv-SE",
-      actionOnEmptyResult: true,
-    });
-
-    res.type("text/xml");
-    return res.send(twiml.toString());
-  }
-
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "Du är en svensk AI-telefonassistent för ett företag med långa telefonköer. Svara kort, vänligt och professionellt. Ställ en enkel följdfråga om det behövs.",
-        },
-        { role: "user", content: userText },
-      ],
-      max_tokens: 140,
-      temperature: 0.4,
-    });
-
-    const aiText =
-      completion.choices?.[0]?.message?.content?.trim() ||
-      "Jag är inte helt säker på att jag förstår. Kan du förtydliga?";
-
-    twiml.say({ voice: "alice", language: "sv-SE" }, aiText);
-
-    // Lyssna vidare i samtalet
-    twiml.gather({
-      input: "speech",
-      action: `${BASE_URL}/gather`,
-      method: "POST",
-      timeout: 8,
-      speechTimeout: "auto",
-      language: "sv-SE",
-      actionOnEmptyResult: true,
-    });
-  } catch (err) {
-    console.error(err);
-    twiml.say(
-      { voice: "alice", language: "sv-SE" },
-      "Ett fel inträffade i systemet. Försök igen om en liten stund."
-    );
-  }
-
-  res.type("text/xml");
-  res.send(twiml.toString());
+  res.type("text/xml").send(vr.toString());
 });
 
-// Health check
-app.get("/", (req, res) => res.send("AIQVoice är igång"));
+// GET för test i browser
+app.get("/voice", (req, res) => app._router.handle(req, res));
 
+// health
+app.get("/", (req, res) => res.send("AIQVoice realtime är igång"));
+
+// ---- 2) WebSocket-server för Twilio Media Streams ----
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/stream") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on("connection", (twilioWs) => {
+  let streamSid = null;
+  let callSid = null;
+  let openaiWs = null;
+  let openaiReady = false;
+
+  // Öppna OpenAI Realtime WS
+  openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1"
+    }
+  });
+
+  openaiWs.on("open", () => {
+    // Viktigt: matcha Twilios format (g711_ulaw 8k) så vi slipper konvertera
+    openaiWs.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          voice: "alloy",
+          instructions:
+            "Du är AiQ (uttalas Aique). Svensk AI-telefonassistent. Superresponsiv, kort, trygg och professionell. Hjälp direkt. Om något är oklart, fråga EN kort följdfråga. Prata svenska.",
+          turn_detection: {
+            type: "server_vad"
+          }
+        }
+      })
+    );
+
+    openaiReady = true;
+  });
+
+  openaiWs.on("message", (raw) => {
+    const msg = JSON.parse(raw.toString());
+
+    // OpenAI skickar TTS-audio i små deltas
+    if (msg.type === "response.audio.delta" && msg.delta) {
+      // Skicka rakt tillbaka till Twilio streamen
+      twilioWs.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: msg.delta }
+        })
+      );
+    }
+
+    // (valfritt) logga text för debugging
+    if (msg.type === "response.text.delta") {
+      // console.log("AiQ text:", msg.delta);
+    }
+  });
+
+  openaiWs.on("close", () => {
+    openaiReady = false;
+  });
+
+  openaiWs.on("error", (e) => {
+    console.error("OpenAI WS error:", e);
+  });
+
+  // Ta emot Twilio audio
+  twilioWs.on("message", (raw) => {
+    const data = JSON.parse(raw.toString());
+
+    if (data.event === "start") {
+      streamSid = data.start.streamSid;
+      callSid = data.start.callSid;
+      return;
+    }
+
+    if (data.event === "media" && data.media?.payload) {
+      if (!openaiReady) return;
+
+      // Skicka caller-audio till OpenAI
+      openaiWs.send(
+        JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: data.media.payload
+        })
+      );
+    }
+
+    if (data.event === "stop") {
+      try {
+        openaiWs.close();
+      } catch {}
+    }
+  });
+
+  twilioWs.on("close", () => {
+    try {
+      openaiWs.close();
+    } catch {}
+  });
+
+  twilioWs.on("error", (e) => {
+    console.error("Twilio WS error:", e);
+  });
+});
+
+// Start server
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Server kör på port", port));
+server.listen(port, () => console.log("Realtime server kör på", port));
