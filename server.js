@@ -66,6 +66,26 @@ wss.on("connection", (twilioWs) => {
   console.log("Twilio WS connected");
 
   let streamSid = null;
+  let hasBufferedAudio = false;
+  let silenceTimer = null;
+
+  const SILENCE_COMMIT_MS = 1200;
+
+  function resetSilenceTimer() {
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
+    }
+
+    if (!hasBufferedAudio || openAiWs.readyState !== WebSocket.OPEN) return;
+
+    silenceTimer = setTimeout(() => {
+      if (openAiWs.readyState !== WebSocket.OPEN) return;
+      openAiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      openAiWs.send(JSON.stringify({ type: "response.create" }));
+      hasBufferedAudio = false;
+    }, SILENCE_COMMIT_MS);
+  }
 
   const openAiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
@@ -89,8 +109,12 @@ wss.on("connection", (twilioWs) => {
           "Svara kort men levande. Om personen är tyst, fråga mjukt om den är kvar.",
         audio: {
           input: {
-            format: { type: "audio/pcmu" },
-            turn_detection: { type: "server_vad" },
+            format: { type: "audio/pcmu", sample_rate: 8000 },
+            turn_detection: {
+              type: "server_vad",
+              silence_duration_ms: 700,
+              threshold: 0.5,
+            },
           },
           output: {
             format: { type: "audio/pcmu" },
@@ -126,11 +150,16 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "input_audio_buffer.speech_stopped") {
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       openAiWs.send(JSON.stringify({ type: "response.create" }));
+      hasBufferedAudio = false;
       return;
     }
 
     // SPEECH START -> STOP AI TALKING DIRECTLY
     if (msg.type === "input_audio_buffer.speech_started") {
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
       if (streamSid) {
         twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
         openAiWs.send(JSON.stringify({ type: "response.cancel" }));
@@ -175,18 +204,29 @@ wss.on("connection", (twilioWs) => {
             audio: data.media.payload,
           })
         );
+        hasBufferedAudio = true;
+        resetSilenceTimer();
       }
       return;
     }
 
     if (data.event === "stop") {
       console.log("Stream stopped");
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+      return;
     }
   });
 
   twilioWs.on("close", () => {
     console.log("Twilio WS closed");
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
+    }
     if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
   });
 });
