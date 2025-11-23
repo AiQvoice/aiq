@@ -1,150 +1,206 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/server.js b/server.js
-index 2ce6e95c9462aa877bb584205a52418309fd389d..c6154b85eca4fe6f9891b6cd66883eee0e443bd7 100644
---- a/server.js
-+++ b/server.js
-@@ -1,36 +1,40 @@
- require("dotenv").config();
- const express = require("express");
- const http = require("http");
- const WebSocket = require("ws");
- 
- const app = express();
- app.use(express.urlencoded({ extended: false }));
- 
- const PORT = process.env.PORT || 10000;
- const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
- 
-+if (!OPENAI_API_KEY) {
-+  throw new Error("Missing OPENAI_API_KEY environment variable");
-+}
-+
- // ----------------------
- // TWILIO VOICE WEBHOOK
- // ----------------------
- app.post("/voice", (req, res) => {
-   const host = req.headers["x-forwarded-host"] || req.headers.host;
- 
-   const twiml =
-     '<?xml version="1.0" encoding="UTF-8"?>' +
-     "<Response>" +
-       '<Say voice="alice" language="sv-SE">' +
-         "Hej. Mitt namn är AiQ. Hur kan jag hjälpa dig i dag?" +
-       "</Say>" +
- 
-       '<Pause length="5"/>' +
- 
-       '<Say voice="alice" language="sv-SE">' +
-         "Hallå. Hör du mig?" +
-       "</Say>" +
- 
-       "<Connect>" +
-         '<Stream url="wss://' + host + '/media-stream" />' +
-       "</Connect>" +
-     "</Response>";
- 
-   res.type("text/xml").send(twiml);
-@@ -57,90 +61,96 @@ server.on("upgrade", (req, socket, head) => {
- 
- // ----------------------
- // TWILIO <-> OPENAI
- // ----------------------
- wss.on("connection", (twilioWs) => {
-   console.log("Twilio WS connected");
- 
-   let streamSid = null;
- 
-   const openAiWs = new WebSocket(
-     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-     {
-       headers: {
-         Authorization: "Bearer " + OPENAI_API_KEY,
-         "OpenAI-Beta": "realtime=v1",
-       },
-     }
-   );
- 
-   function sendSessionUpdate() {
-     const update = {
-       type: "session.update",
-       session: {
-         modalities: ["audio"],
-         instructions:
--          "Du ar AiQ, en varm, mjuk och lugn svensk AI-assistent. " +
--          "Prata som en vanlig mannisklig van: lugnt tempo, varm ton, " +
--          "enkla meningar, och naturliga pauser. " +
--          "Svara kort men levande. Om personen ar tyst, fraga mjukt om den ar kvar.",
-+          "Du är AiQ, en varm, mjuk och lugn svensk AI-assistent. " +
-+          "Prata som en vanlig mänsklig vän: lugnt tempo, varm ton, " +
-+          "enkla meningar och naturliga pauser. " +
-+          "Svara kort men levande. Om personen är tyst, fråga mjukt om den är kvar.",
-         audio: {
-           input: {
-             format: { type: "audio/pcmu" },
-             turn_detection: { type: "server_vad" },
-           },
-           output: {
-             format: { type: "audio/pcmu" },
-             voice: "verse",
-           },
-         },
-       },
-     };
- 
-     console.log("Sending session.update");
-     openAiWs.send(JSON.stringify(update));
-   }
- 
-   // OPENAI CONNECT
-   openAiWs.on("open", () => {
-     console.log("OpenAI WS open");
-     setTimeout(sendSessionUpdate, 300);
-   });
- 
-   openAiWs.on("message", (raw) => {
-     let msg;
-     try {
-       msg = JSON.parse(raw.toString());
-     } catch (e) {
-       return;
-     }
- 
-     if (msg.type === "error") {
-       console.log("OPENAI ERROR:", msg);
-       return;
-     }
- 
-+    if (msg.type === "input_audio_buffer.speech_stopped") {
-+      openAiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-+      openAiWs.send(JSON.stringify({ type: "response.create" }));
-+      return;
-+    }
-+
-     // SPEECH START -> STOP AI TALKING DIRECTLY
-     if (msg.type === "input_audio_buffer.speech_started") {
-       if (streamSid) {
-         twilioWs.send(JSON.stringify({ event: "clear", streamSid: streamSid }));
-         openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-       }
-     }
- 
-     // SEND AI AUDIO BACK TO TWILIO
-     if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
-       twilioWs.send(
-         JSON.stringify({
-           event: "media",
-           streamSid: streamSid,
-           media: { payload: msg.delta },
-         })
-       );
-     }
-   });
- 
-   openAiWs.on("close", () => console.log("OpenAI WS closed"));
-   openAiWs.on("error", (err) => console.log("OpenAI WS error:", err));
- 
-   // TWILIO -> OPENAI AUDIO
-   twilioWs.on("message", (raw) => {
- 
-EOF
-)
+import dotenv from "dotenv";
+dotenv.config();
+
+import Fastify from "fastify";
+import fastifyFormBody from "@fastify/formbody";
+import fastifyWs from "@fastify/websocket";
+import WebSocket from "ws";
+
+const {
+  OPENAI_API_KEY,
+  DOMAIN,
+  PORT
+} = process.env;
+
+if (!OPENAI_API_KEY) {
+  throw new Error("Missing OPENAI_API_KEY in env");
+}
+if (!DOMAIN) {
+  throw new Error("Missing DOMAIN in env, e.g. aiqvoice.onrender.com");
+}
+
+const fastify = Fastify();
+fastify.register(fastifyFormBody);
+fastify.register(fastifyWs);
+
+// --- Persona / system message (SVENSKA) ---
+const SYSTEM_MESSAGE = `
+Du är AiQ (uttalas "Aique"). Du är en varm, professionell svensk AI-telefonist.
+Regler:
+- Presentera dig direkt när samtalet startar: "Hej! Mitt namn är AiQ. Hur kan jag hjälpa dig?"
+- Kör en naturlig dialog på svenska, korta meningar.
+- Vänta inte på pip. Lyssna direkt när användaren pratar.
+- Om du inte hör användaren i cirka 5 sekunder efter att du pratat klart, säg: "Hallå, är du kvar?"
+- Om användaren pratar samtidigt som du pratar: sluta prata och lyssna.
+`;
+
+// Du kan testa andra röster senare.
+// "alloy" funkar stabilt i Realtime.
+const VOICE = "alloy";
+const TEMPERATURE = 0.6;
+
+// Root test
+fastify.get("/", async (_, reply) => {
+  reply.send({ ok: true, message: "AiQvoice server is running" });
+});
+
+// --- Twilio Voice webhook (inkommande samtal) ---
+// Twilio kommer göra POST hit när någon ringer ditt Twilio-nummer.
+fastify.post("/voice", async (req, reply) => {
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://${DOMAIN}/media-stream" />
+  </Connect>
+</Response>`;
+  reply.header("Content-Type", "text/xml").send(twiml);
+});
+
+// --- Media Stream WS: proxy Twilio <-> OpenAI Realtime ---
+fastify.register(async (fastifyInstance) => {
+  fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
+    console.log("Twilio stream connected");
+
+    // 1) OpenAI Realtime WS (viktig modell/endpoint)
+    const openAiWs = new WebSocket(
+      `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`,
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+      }
+    );
+
+    let streamSid = null;
+    let openAiReady = false;
+
+    const sendSessionUpdate = () => {
+      const sessionUpdate = {
+        type: "session.update",
+        session: {
+          type: "realtime",
+          model: "gpt-realtime",
+          output_modalities: ["audio"],
+          audio: {
+            input: {
+              format: { type: "audio/pcmu" },
+              turn_detection: { type: "server_vad" }
+            },
+            output: {
+              format: { type: "audio/pcmu" },
+              voice: VOICE
+            }
+          },
+          instructions: SYSTEM_MESSAGE
+        }
+      };
+
+      openAiWs.send(JSON.stringify(sessionUpdate));
+
+      // AI ska prata först (greeting)
+      const greet = {
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [{
+            type: "input_text",
+            text: 'Starta samtalet nu med: "Hej! Mitt namn är AiQ. Hur kan jag hjälpa dig?"'
+          }]
+        }
+      };
+      openAiWs.send(JSON.stringify(greet));
+      openAiWs.send(JSON.stringify({ type: "response.create" }));
+    };
+
+    openAiWs.on("open", () => {
+      console.log("OpenAI WS open");
+      openAiReady = true;
+      setTimeout(sendSessionUpdate, 120);
+    });
+
+    openAiWs.on("message", (data) => {
+      let msg;
+      try {
+        msg = JSON.parse(data);
+      } catch (e) {
+        console.error("Bad JSON from OpenAI:", data);
+        return;
+      }
+
+      if (msg.type === "session.updated") {
+        console.log("Session updated");
+      }
+
+      // Audio från OpenAI -> Twilio
+      if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
+        const audioDelta = {
+          event: "media",
+          streamSid,
+          media: { payload: Buffer.from(msg.delta, "base64").toString("base64") }
+        };
+        connection.send(JSON.stringify(audioDelta));
+      }
+
+      if (msg.type === "error") {
+        console.error("OpenAI error:", msg);
+      }
+    });
+
+    // 2) Twilio -> OpenAI
+    connection.on("message", (message) => {
+      let data;
+      try {
+        data = JSON.parse(message);
+      } catch (e) {
+        console.error("Bad JSON from Twilio:", message);
+        return;
+      }
+
+      switch (data.event) {
+        case "start":
+          streamSid = data.start.streamSid;
+          console.log("Stream started:", streamSid);
+          break;
+
+        case "media":
+          // Skicka inkommande mic-audio till OpenAI
+          if (openAiReady) {
+            openAiWs.send(JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: data.media.payload
+            }));
+          }
+          break;
+
+        case "stop":
+          console.log("Stream stopped");
+          try { openAiWs.close(); } catch {}
+          break;
+      }
+    });
+
+    connection.on("close", () => {
+      console.log("Twilio WS closed");
+      try { openAiWs.close(); } catch {}
+    });
+
+    openAiWs.on("close", () => {
+      console.log("OpenAI WS closed");
+      try { connection.close(); } catch {}
+    });
+
+    openAiWs.on("error", (err) => {
+      console.error("OpenAI WS err:", err);
+    });
+  });
+});
+
+const listenPort = PORT || 10000;
+fastify.listen({ port: listenPort, host: "0.0.0.0" }, (err) => {
+  if (err) {
+    console.error(err);
+    process.exit(1);
+  }
+  console.log("Server running on port", listenPort);
+});
