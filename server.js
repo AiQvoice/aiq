@@ -9,6 +9,10 @@ app.use(express.urlencoded({ extended: false }));
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+if (!OPENAI_API_KEY) {
+  throw new Error("Missing OPENAI_API_KEY environment variable");
+}
+
 // ----------------------
 // TWILIO VOICE WEBHOOK
 // ----------------------
@@ -79,10 +83,10 @@ wss.on("connection", (twilioWs) => {
       session: {
         modalities: ["audio"],
         instructions:
-          "Du ar AiQ, en varm, mjuk och lugn svensk AI-assistent. " +
-          "Prata som en vanlig mannisklig van: lugnt tempo, varm ton, " +
-          "enkla meningar, och naturliga pauser. " +
-          "Svara kort men levande. Om personen ar tyst, fraga mjukt om den ar kvar.",
+          "Du är AiQ, en varm, mjuk och lugn svensk AI-assistent. " +
+          "Prata som en vanlig mänsklig vän: lugnt tempo, varm ton, " +
+          "enkla meningar och naturliga pauser. " +
+          "Svara kort men levande. Om personen är tyst, fråga mjukt om den är kvar.",
         audio: {
           input: {
             format: { type: "audio/pcmu" },
@@ -116,6 +120,12 @@ wss.on("connection", (twilioWs) => {
 
     if (msg.type === "error") {
       console.log("OPENAI ERROR:", msg);
+      return;
+    }
+
+    if (msg.type === "input_audio_buffer.speech_stopped") {
+      openAiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      openAiWs.send(JSON.stringify({ type: "response.create" }));
       return;
     }
 
