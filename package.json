@@ -1,17 +1,26 @@
-{
-  "name": "aiqvoice",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "ws": "^8.18.0"
-  }
-}
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/package.json b/package.json
+index 373e041782256d8313027766a21f806b8430e734..59b22bc4e0e1f7e4edd84ddb996b082816b302a6 100644
+--- a/package.json
++++ b/package.json
+@@ -1,17 +1,16 @@
+ {
+   "name": "aiqvoice",
+   "version": "1.0.0",
+-  "type": "module",
+   "main": "server.js",
+   "scripts": {
+     "start": "node server.js"
+   },
+   "engines": {
+     "node": ">=18"
+   },
+   "dependencies": {
+     "dotenv": "^16.4.5",
+     "express": "^4.19.2",
+     "ws": "^8.18.0"
+   }
+ }
+ 
+EOF
+)
